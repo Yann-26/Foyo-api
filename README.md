@@ -23,10 +23,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 ## Deploy (production)
 
-```bash
-export POSTGRES_PASSWORD=…  JWT_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(48))")
-docker compose up -d --build
-```
+`docker-compose.yml` runs the whole stack on one server: **Caddy** (HTTPS, certificate renewed automatically)
+→ the **API** → **Postgres**, plus the **worker**. Settings go in a `.env` next to it (template:
+`deploy/server.env.example`), then `docker compose up -d --build`. Step by step on AWS Lightsail below.
+
+- Only Caddy is reachable from outside (ports 80, 443). The API and Postgres have no published port; the API
+  trusts `X-Forwarded-For` only from Caddy's fixed address, so client IPs (rate limits) can't be faked.
+- Container logs are capped (10 MB × 5 per container).
 
 - The image starts as root only to make the photo folder writable (`docker/entrypoint.sh`), then runs as the
   unprivileged `foyo` user. The default command (`docker/start-api.sh`) applies `alembic upgrade head` once and
@@ -40,6 +43,73 @@ docker compose up -d --build
 - Times ("today", due dates, the evening report) use `TIMEZONE` (default `Africa/Abidjan`), not the server clock.
 - Sign-in locks an account for 15 min after 5 wrong passwords (`LOGIN_MAX_FAILURES`, `LOGIN_LOCK_MINUTES`);
   a password reset unlocks it.
+
+## Deploy on AWS Lightsail
+
+One Lightsail instance runs the stack above. Paris (`eu-west-3`) is the closest AWS region to Abidjan.
+
+**1. Create the server** (Lightsail console › Create instance)
+- Region **Paris**, platform **Linux/Unix**, blueprint **OS only › Ubuntu 24.04 LTS**.
+- Plan: **2 GB RAM** (Postgres + API + worker + Caddy use about 1 GB; building the image needs headroom).
+- Name it `foyo-api`, create it.
+
+**2. Network**
+- Networking › **Create static IP**, attach it to the instance (the address must not change).
+- Instance › Networking › IPv4 firewall: keep **SSH (22)**, ideally restricted to your own IP; add **HTTP (80)**
+  and **HTTPS (443)**. Nothing else: never open 8000 or 5432.
+- At your DNS provider: an **A** record, e.g. `api.your-domain.com` → the static IP. Wait until it resolves
+  (`dig +short api.your-domain.com`). Caddy can only get the certificate once it does.
+
+**3. Prepare the server** (Connect using SSH)
+```bash
+sudo apt update && sudo apt -y upgrade
+sudo apt -y install git unattended-upgrades       # security updates install themselves
+curl -fsSL https://get.docker.com | sudo sh        # Docker's official install script
+sudo usermod -aG docker "$USER" && newgrp docker
+# 2 GB of swap: protects the small server during image builds
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+**4. Code and settings**
+```bash
+git clone https://github.com/Yann-26/foyo-api.git && cd foyo-api   # private repo: use a deploy key or token
+cp deploy/server.env.example .env && chmod 600 .env
+openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-48   # run twice: POSTGRES_PASSWORD and JWT_SECRET
+nano .env                                               # DOMAIN, the two secrets, Gmail, etc.
+```
+Push notifications: copy the Firebase service-account JSON to `secrets/fcm.json` (e.g. with `scp`), then set
+`PUSH_BACKEND=fcm` in `.env`.
+
+**5. Start**
+```bash
+docker compose up -d --build
+docker compose ps                         # all "Up"; the API "healthy" after a few seconds
+curl https://api.your-domain.com/healthz  # {"status":"ok"}
+```
+Migrations run at each start; the 30 starter dishes are loaded; no demo data (the first account comes from
+the app). Then build the app with `--dart-define=API_BASE_URL=https://api.your-domain.com` and set the
+RevenueCat webhook to `https://api.your-domain.com/api/v1/webhooks/revenuecat`.
+
+**6. Backups** (database + photos, every night)
+```bash
+sudo mkdir -p /var/backups/foyo && sudo chown "$USER" /var/backups/foyo
+deploy/backup.sh                          # try it once: prints "Backup OK: …"
+crontab -e                                # add the line below (02:30 UTC = 02:30 in Abidjan)
+30 2 * * * $HOME/foyo-api/deploy/backup.sh >> $HOME/foyo-backup.log 2>&1
+```
+- Kept `BACKUP_KEEP_DAYS` days (default 14) in `/var/backups/foyo`, readable by their owner only.
+- **A copy off the server is strongly recommended:** create an S3 bucket in `eu-west-3`, an IAM user allowed
+  only `s3:PutObject` on it, install the AWS CLI (`sudo snap install aws-cli --classic`), run `aws configure`
+  with that user's keys, and set `BACKUP_S3_URI=s3://your-bucket/foyo` in `.env`.
+- Also turn on Lightsail **automatic snapshots** (instance › Snapshots) as a second safety net.
+- Restore (replaces the current data; asks you to type RESTORE):
+  `deploy/restore.sh /var/backups/foyo/foyo-<date>.dump /var/backups/foyo/foyo-<date>-media.tar.gz`
+
+**7. Day to day**
+- Update: `git pull && docker compose up -d --build` (migrations apply themselves).
+- Logs: `docker compose logs -f api` (or `worker`, `caddy`).
+- Usage / crash summary: `docker compose exec api python -m scripts.telemetry_report 7`.
 
 ## Deploy on Render
 

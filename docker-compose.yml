@@ -1,12 +1,34 @@
-# Production-like stack. Put real values in the environment (or a .env next to this file):
-#   JWT_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(48))") POSTGRES_PASSWORD=... docker compose up -d
-# Push: put the Firebase service-account key in ./secrets/fcm.json, then add
-#   PUSH_BACKEND=fcm FCM_CREDENTIALS_FILE=/run/secrets/fcm.json
-# Serve it behind HTTPS (Caddy, Nginx, a PaaS load balancer…): the mobile app requires https://.
+# Production stack for one server (e.g. AWS Lightsail): Caddy (HTTPS) → API, the reminder worker, Postgres.
+# Settings go in a .env file next to this file (template: deploy/server.env.example). Then:
+#   docker compose up -d --build
+# Push: put the Firebase service-account key in ./secrets/fcm.json and set PUSH_BACKEND=fcm in .env.
+# Guide: README.md › "Deploy on AWS Lightsail".
+
+x-logging: &logging # keep container logs from filling the disk
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
 services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    logging: *logging
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN (e.g. api.your-domain.com)}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      default: { ipv4_address: 172.28.0.10 }
+    depends_on:
+      api: { condition: service_started }
+
   db:
     image: postgres:17
     restart: unless-stopped
+    logging: *logging
     environment:
       POSTGRES_USER: foyo
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
@@ -16,42 +38,53 @@ services:
       test: ["CMD-SHELL", "pg_isready -U foyo -d foyo"]
       interval: 5s
       retries: 20
+
   api:
     build: { context: ., dockerfile: docker/Dockerfile }
     restart: unless-stopped
-    environment:
+    logging: *logging
+    # No published port: only Caddy reaches the API, on the internal network.
+    environment: &app-env
       ENVIRONMENT: production
       DATABASE_URL: postgresql+psycopg://foyo:${POSTGRES_PASSWORD}@db:5432/foyo
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (32+ random characters)}
+      TIMEZONE: ${TIMEZONE:-Africa/Abidjan}
+      PUBLIC_API_URL: https://${DOMAIN}
       EMAIL_BACKEND: ${EMAIL_BACKEND:-log}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      TIMEZONE: ${TIMEZONE:-Africa/Abidjan}
       PUSH_BACKEND: ${PUSH_BACKEND:-log}
-      FCM_CREDENTIALS_FILE: ${FCM_CREDENTIALS_FILE:-}
+      FCM_CREDENTIALS_FILE: /run/secrets/fcm.json
+      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-}
+      APPLE_AUDIENCES: ${APPLE_AUDIENCES:-}
       REVENUECAT_WEBHOOK_SECRET: ${REVENUECAT_WEBHOOK_SECRET:-}
       MEDIA_DIR: /data/media
-      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      # Only Caddy (fixed address below) may tell the API the real client IP.
+      FORWARDED_ALLOW_IPS: 172.28.0.10
     volumes: ["./secrets:/run/secrets:ro", "media:/data/media"]
-    ports: ["8000:8000"]
     depends_on:
       db: { condition: service_healthy }
-  # Reminders (tasks, medications, bills, 21:00 report). Exactly one instance.
+
+  # Reminders, recurring operations, purges. Exactly one instance.
   worker:
     build: { context: ., dockerfile: docker/Dockerfile }
     restart: unless-stopped
+    logging: *logging
     command: ["python", "-m", "app.workers.scheduler"]
     healthcheck: { disable: true }
-    environment:
-      ENVIRONMENT: production
-      DATABASE_URL: postgresql+psycopg://foyo:${POSTGRES_PASSWORD}@db:5432/foyo
-      JWT_SECRET: ${JWT_SECRET}
-      TIMEZONE: ${TIMEZONE:-Africa/Abidjan}
-      PUSH_BACKEND: ${PUSH_BACKEND:-log}
-      FCM_CREDENTIALS_FILE: ${FCM_CREDENTIALS_FILE:-}
+    environment: *app-env
     volumes: ["./secrets:/run/secrets:ro"]
     depends_on:
       api: { condition: service_started }
+
+networks:
+  default:
+    ipam:
+      config: [{ subnet: 172.28.0.0/24 }]
+
 volumes:
   pgdata:
   media:
+  caddy_data: # certificates: keep it, Let's Encrypt limits how often they can be re-issued
+  caddy_config:
