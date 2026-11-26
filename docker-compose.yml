@@ -1,0 +1,57 @@
+# Production-like stack. Put real values in the environment (or a .env next to this file):
+#   JWT_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(48))") POSTGRES_PASSWORD=... docker compose up -d
+# Push: put the Firebase service-account key in ./secrets/fcm.json, then add
+#   PUSH_BACKEND=fcm FCM_CREDENTIALS_FILE=/run/secrets/fcm.json
+# Serve it behind HTTPS (Caddy, Nginx, a PaaS load balancer…): the mobile app requires https://.
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: foyo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: foyo
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U foyo -d foyo"]
+      interval: 5s
+      retries: 20
+  api:
+    build: { context: ., dockerfile: docker/Dockerfile }
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://foyo:${POSTGRES_PASSWORD}@db:5432/foyo
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (32+ random characters)}
+      EMAIL_BACKEND: ${EMAIL_BACKEND:-log}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      TIMEZONE: ${TIMEZONE:-Africa/Abidjan}
+      PUSH_BACKEND: ${PUSH_BACKEND:-log}
+      FCM_CREDENTIALS_FILE: ${FCM_CREDENTIALS_FILE:-}
+      REVENUECAT_WEBHOOK_SECRET: ${REVENUECAT_WEBHOOK_SECRET:-}
+      MEDIA_DIR: /data/media
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    volumes: ["./secrets:/run/secrets:ro", "media:/data/media"]
+    ports: ["8000:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+  # Reminders (tasks, medications, bills, 21:00 report). Exactly one instance.
+  worker:
+    build: { context: ., dockerfile: docker/Dockerfile }
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "app.workers.scheduler"]
+    healthcheck: { disable: true }
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://foyo:${POSTGRES_PASSWORD}@db:5432/foyo
+      JWT_SECRET: ${JWT_SECRET}
+      TIMEZONE: ${TIMEZONE:-Africa/Abidjan}
+      PUSH_BACKEND: ${PUSH_BACKEND:-log}
+      FCM_CREDENTIALS_FILE: ${FCM_CREDENTIALS_FILE:-}
+    volumes: ["./secrets:/run/secrets:ro"]
+    depends_on:
+      api: { condition: service_started }
+volumes:
+  pgdata:
+  media:
