@@ -63,3 +63,32 @@ def test_upgrading_a_populated_sqlite_db_keeps_memberships(tmp_path, monkeypatch
         assert conn.execute(text("SELECT user_id FROM members WHERE id = 'm1'")).scalar() == "u1"
         assert conn.execute(text("SELECT push_enabled FROM users WHERE id = 'u1'")).scalar() == 1
         assert conn.execute(text("PRAGMA foreign_keys")).scalar() == 1  # switched back on
+
+
+def test_starter_dishes_survive_a_concurrent_start(monkeypatch):
+    """Two API processes loading the catalogue at once: the loser starts over instead of failing."""
+    from sqlalchemy.exc import IntegrityError
+
+    from app.application import starter_dishes
+    from app.core.database import SessionLocal
+
+    calls = {"n": 0}
+
+    class Racing:
+        def __init__(self, db):
+            self.db = db
+
+        def __getattr__(self, name):
+            return getattr(self.db, name)
+
+        def commit(self):
+            calls["n"] += 1
+            if calls["n"] == 1:  # someone else inserted first
+                self.db.rollback()
+                raise IntegrityError("insert", {}, Exception("duplicate key"))
+            self.db.commit()
+
+    with SessionLocal() as db:
+        starter_dishes.ensure_starter_dishes(Racing(db))
+        assert calls["n"] == 2
+        assert starter_dishes.ensure_starter_dishes(db) == 0  # all 30 present

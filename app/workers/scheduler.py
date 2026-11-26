@@ -11,7 +11,7 @@ import time
 from app.core import clock
 from app.core.database import SessionLocal
 from app.core.logging import setup_logging
-from app.infrastructure.notifications.fcm_client import check_config
+from app.infrastructure.notifications.fcm_client import PushConfigError, check_config
 from app.workers.reminder_jobs import JOBS
 
 log = logging.getLogger("foyo.worker")
@@ -32,7 +32,11 @@ def run_once(now=None) -> dict[str, int]:  # noqa: ANN001
 
 def run_forever(interval: int = 60) -> None:
     setup_logging()
-    check_config()
+    try:
+        check_config()
+    except PushConfigError as e:
+        # Keep running: recurring operations and purges don't need push. Fix the setting and redeploy.
+        log.error("Push notifications disabled: %s", e)
     log.info("Reminder worker started (every %ss)", interval)
     while True:
         started = time.monotonic()

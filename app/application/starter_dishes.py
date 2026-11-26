@@ -2,6 +2,7 @@
 for the whole dish; households copy a dish to adjust it. Loaded on every start: new or changed starters
 reach existing installations, ids never change."""
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.infrastructure.db.models import Dish
@@ -98,8 +99,9 @@ def ingredients_json(items: list[tuple]) -> list[dict]:
     return [{"name": n, "quantity": q, "price": p, "in_stock": False, "place": pl} for n, q, p, pl in items]
 
 
-def ensure_starter_dishes(db: Session) -> int:
-    """Creates or refreshes the shared catalogue. Returns how many rows changed."""
+def ensure_starter_dishes(db: Session, _retry: bool = True) -> int:
+    """Creates or refreshes the shared catalogue. Returns how many rows changed. Safe when several API
+    processes start at once: if another one inserted a dish first, it starts over and finds it."""
     changed = 0
     for did, name, slot, servings, prep, subtitle, ingr in STARTERS:
         values = {
@@ -114,5 +116,11 @@ def ensure_starter_dishes(db: Session) -> int:
             for k, v in values.items():
                 setattr(d, k, v)
             changed += 1
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if not _retry:
+            raise
+        return ensure_starter_dishes(db, _retry=False)
     return changed

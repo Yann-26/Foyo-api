@@ -1,0 +1,92 @@
+# Render Blueprint: Postgres + the API (with a disk for photos) + the reminder worker.
+# Render dashboard › New › Blueprint › pick this repository. See README.md › "Deploy on Render".
+#
+# Plans are paid: the worker can't be free, a disk needs a paid service, and free Postgres is deleted after
+# 30 days. Values marked `sync: false` are asked for in the dashboard when the Blueprint is created.
+
+databases:
+  - name: foyo-db
+    databaseName: foyo
+    user: foyo
+    plan: 0.1c-256mb
+    region: frankfurt # closest Render region to Abidjan; can't be changed later
+    postgresMajorVersion: "17" # the version the migrations are tested on
+
+envVarGroups:
+  - name: foyo-shared
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: JWT_SECRET # generated once, shared by the API and the worker
+        generateValue: true
+      - key: TIMEZONE
+        value: Africa/Abidjan
+      - key: MEDIA_DIR
+        value: /data/media
+      - key: PUSH_BACKEND
+        value: fcm
+      # Firebase service-account JSON: add it in the dashboard as a Secret File named fcm.json
+      # (Environment › Secret Files) on both services; Render mounts it here.
+      - key: FCM_CREDENTIALS_FILE
+        value: /etc/secrets/fcm.json
+
+services:
+  - type: web
+    name: foyo-api
+    runtime: docker
+    dockerfilePath: ./docker/Dockerfile
+    dockerContext: .
+    plan: 0.5c-512mb
+    region: frankfurt
+    healthCheckPath: /healthz
+    # Uploaded photos (task proofs, receipts). With a disk the service runs as one instance and a deploy
+    # has a few seconds of downtime.
+    disk:
+      name: media
+      mountPath: /data/media
+      sizeGB: 1
+    envVars:
+      - fromGroup: foyo-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: foyo-db
+          property: connectionString
+      - key: WEB_CONCURRENCY
+        value: "2"
+      # Only Render's proxy can reach the service, so its X-Forwarded-For can be trusted (real client IPs
+      # for the rate limits).
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"
+      # E-mail (Gmail SMTP with an App Password)
+      - key: EMAIL_BACKEND
+        value: smtp
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      # Links in e-mails: your API address (defaults to https://foyo-api.onrender.com when left empty)
+      - key: PUBLIC_API_URL
+        sync: false
+      # Google / Apple sign-in (JSON lists, e.g. ["123-abc.apps.googleusercontent.com"])
+      - key: GOOGLE_CLIENT_IDS
+        sync: false
+      - key: APPLE_AUDIENCES
+        sync: false
+      # RevenueCat webhook: same value as its Authorization header in the RevenueCat dashboard
+      - key: REVENUECAT_WEBHOOK_SECRET
+        sync: false
+
+  - type: worker
+    name: foyo-worker
+    runtime: docker
+    dockerfilePath: ./docker/Dockerfile
+    dockerContext: .
+    dockerCommand: python -m app.workers.scheduler # reminders, recurring operations, purges; one instance
+    plan: 0.5c-512mb
+    region: frankfurt
+    envVars:
+      - fromGroup: foyo-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: foyo-db
+          property: connectionString

@@ -11,7 +11,8 @@ log = logging.getLogger("foyo.config")
 class Settings(BaseSettings):
     """Runtime settings, read from the environment or `.env`."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # env_ignore_empty: a variable left blank (e.g. an optional secret in a hosting dashboard) counts as unset.
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", env_ignore_empty=True)
 
     app_name: str = "Foyo API"
     # "production" unless told otherwise: a forgotten setting must fail safe, not open.
@@ -43,6 +44,8 @@ class Settings(BaseSettings):
     smtp_timeout_seconds: int = 15
     # Where this API is reachable from the outside (links in e-mails, e.g. e-mail verification).
     public_api_url: str = "http://localhost:8000"
+    # Set by Render on web services (https://<name>.onrender.com): used when PUBLIC_API_URL isn't set.
+    render_external_url: str = ""
     # Google / Apple sign-in: accepted OAuth client ids (web/Android/iOS) and Apple bundle / service ids.
     google_client_ids: list[str] = []
     apple_audiences: list[str] = []
@@ -75,6 +78,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check(self) -> "Settings":
+        # Hosts (Render, Heroku…) give "postgresql://" or "postgres://"; SQLAlchemy needs the psycopg driver.
+        for prefix in ("postgresql://", "postgres://"):
+            if self.database_url.startswith(prefix):
+                self.database_url = "postgresql+psycopg://" + self.database_url[len(prefix) :]
+        if self.public_api_url == "http://localhost:8000" and self.render_external_url:
+            self.public_api_url = self.render_external_url.rstrip("/")
         if self.seed_demo is None:
             self.seed_demo = self.is_dev
         if self.is_dev:

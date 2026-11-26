@@ -40,7 +40,7 @@ services:
   worker:
     build: { context: ., dockerfile: docker/Dockerfile }
     restart: unless-stopped
-    entrypoint: ["python", "-m", "app.workers.scheduler"]
+    command: ["python", "-m", "app.workers.scheduler"]
     healthcheck: { disable: true }
     environment:
       ENVIRONMENT: production
